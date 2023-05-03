@@ -1,0 +1,650 @@
+---
+title: "Predicting the transfer market value of soccer players"
+subtitle: "UCSB Winter 2023 PSTAT131 final project"
+author: "Yang Hu"
+output:
+    html_document:
+      theme:
+        bootswatch: vapor
+      toc: true
+      toc_float: true
+      code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE,
+                      warning = FALSE)
+
+vapor_theme <- function() {
+  theme_minimal() +
+    theme(
+      plot.background = element_rect(fill = "#2A2E37", color = NA),
+      panel.background = element_rect(fill = "#2A2E37", color = NA),
+      panel.grid.major = element_line(color = "#3F4551"),
+      panel.grid.minor = element_line(color = "#3F4551"),
+      strip.background = element_rect(fill = "#2A2E37", color = "#3F4551"),
+      axis.ticks = element_line(color = "#3F4551"),
+      axis.title.x = element_text(size = 12, color = "#B2B6BB", margin = ggplot2::margin(t = 10)),
+      axis.title.y = element_text(size = 12, color = "#B2B6BB", margin = ggplot2::margin(r = 10)),
+      axis.text.x = element_text(size = 10, color = "#B2B6BB"),
+      axis.text.y = element_text(size = 10, color = "#B2B6BB"),
+      legend.background = element_rect(fill = "#2A2E37", color = NA),
+      legend.key = element_rect(fill = "#2A2E37", color = NA),
+      legend.title = element_text(size = 12, color = "#B2B6BB"),
+      legend.text = element_text(size = 10, color = "#B2B6BB"),
+      plot.title = element_text(size = 14, color = "#B2B6BB", margin = ggplot2::margin(b = 10)),
+      strip.text = element_text(size = 12, color = "#B2B6BB")
+    )
+}
+
+
+```
+
+## Introduction
+
+The purpose of this project is to develop a model that will predict the transfer market value of soccer players from the Top 5 leagues.
+
+![](image/trophy.gif)
+
+### What Are We Trying to Do and Why?
+
+In this project, we aim to create a data-driven model that can accurately estimate the transfer market value of soccer players based on various factors, such as their performance, age, position, and other relevant attributes. By leveraging historical transfer data and player statistics, we intend to build a model that can assist clubs, agents, and other stakeholders in making more informed decisions during the transfer negotiation process.
+
+
+## Loading Packages and Data
+
+First, let’s load in all of our packages and the raw data.
+
+```{r}
+library(reader)
+library(tidyverse)
+library(dplyr)
+library(tidymodels)
+library(readr)
+library(kknn)
+library(janitor)
+library(ISLR)
+library(discrim)
+library(poissonreg)
+library(glmnet)
+library(corrr)
+library(corrplot)
+library(randomForest)
+library(xgboost)
+library(rpart.plot)
+library(vip)
+library(ranger)
+library(tidytext)
+library(ggplot2)
+library(ggrepel)
+theme_set(theme_bw())
+```
+
+```{r}
+# Assigning the data to a variable
+tmv <- read_csv2("data/unprocessed/tmvdata.csv")
+tidymodels_prefer()
+set.seed(0321)
+```
+```{r}
+head(tmv)
+```
+
+This data was taken from the Kaggle data set, “[Soccer players values and their statistics](https://www.kaggle.com/datasets/kriegsmaschine/soccer-players-values-and-their-statistics)”, and it was scraped from transfermarkt.de and fbref.com by user RSKRIEGS.
+
+##  Exploring and Tidying the Raw Data
+
+```{r}
+dim(tmv)
+```
+
+The dataset we are working with has a total of 2644 rows and 41 columns. Each row represents a player and each column represents a variable that contains the statistics for the player. The variable named `value` represents the actual transfer market value of a player and will be our response variable. However, due to computational constraints, we will only consider 18 variables out of the total 399 predictors, chosen based on their importance. We will exclude the goalkeeper position since we do not have sufficient statistics for them. Additionally, we remove any rows with missing data from our analysis.
+
+
+```{r}
+tmv <- tmv %>% 
+  select(c("player","nationality", "position", "age", "value", "foot", "minutes", "goals", "assists", "shots_on_target_pct", "passes", "tackles", "blocks", "interceptions", "clearances", "errors", "touches", "dribbles", "fouls", "aerials_won")) %>% 
+  filter(position != "GK") %>%
+  select(value, everything()) %>% 
+  na.omit() %>% 
+  clean_names()
+
+write_csv(tmv, "data/processed/tmv_final.csv")
+```
+
+### Missing and wrong data
+
+Let's examine more about the cleanliness of our data.
+
+```{r}
+summary(tmv)
+```
+
+Although we have already omitted the rows with missing values, we notice that there are value of "age" being 0, which are wrong inputs. Since there are only 2 of such rows, we simply omit them.
+
+```{r}
+nrow(filter(tmv, age == 0))
+tmv <- filter(tmv, age != 0)
+```
+
+### Tidying the Outcome Variable
+
+The raw data present `value` in Euros. We convert it to millions of euros for clearer representations.
+```{r}
+tmv <- tmv %>% mutate(value = value/1e6)
+```
+
+### Tidying the nationalnality variable
+
+```{r}
+tmv %>%
+  distinct(nationality) %>%
+  n_distinct()
+```
+
+The data set includes players of 101 nationalities and it might not be very useful to analyze all. Thus, we prioritize the top 20 most common nationalities and count the rest as `other`.
+
+```{r}
+top20_nationalities <- tmv %>%
+  count(nationality) %>%
+  arrange(desc(n)) %>%
+  head(20) %>%
+  pull(nationality)
+tmv <- tmv %>%
+  mutate(nationality = ifelse(nationality %in% top20_nationalities, nationality, "Other"))
+```
+
+Our dataset is now tidied and ready for some exploratory data analysis!
+
+![](image/grealish.gif)
+
+## Exploratory Data Analysis
+
+### Loading Data and Converting Factors
+
+First, we need to convert the categorical variables `nationality`,`position`, and `foot` into factors.
+```{r}
+summarise_all(tmv, ~ any(is.numeric(.)))
+tmv <- tmv %>%
+  mutate(nationality = factor(nationality),
+         position = factor(position),
+         foot = factor(foot))
+```
+
+### Visual EDA
+
+#### Transfer market values
+
+First, let's explore the distribution of our response, `value`.
+
+```{r}
+ggplot(data = tmv, aes(x = value)) +
+  geom_histogram(fill = "pink") +
+  labs(title = "Distribution of Player Values", x = "Value (in millions of euros)") + vapor_theme()
+```
+
+The possible values of `value` range from 0 to 180 but most of the value are under 50. The overall situation is not like what we usually hear about from the news :most players on the transfer market do not worth much, even though our data are taken from the top 5 leagues.
+
+#### Age and nationality
+
+Now lets see the player values of different ages and nationalities. The top 10 valued players are labeled with their names. 4 of the 10 come from England! That is probably why fans of the England national team always have a very high expectation in the world cup.
+
+
+```{r}
+ggplot(tmv, aes(x = age, y = value, color = nationality)) +
+  geom_point(alpha = 0.5)  +
+  labs(x = "Age", y = "Transfer Value (in millions of euros)", color = "Nationality") +
+  geom_text_repel(data = tmv %>% top_n(10, value), 
+                  aes(label = player))+ vapor_theme()
+
+```
+
+![](image/cover.jpg)
+
+#### Correlation Plot
+
+Now let's examine the relationships between all the numeric values using a correlation plot.
+
+```{r}
+tmv %>%
+  mutate(foot = as.numeric(foot)) %>% 
+  mutate(position = as.numeric(position)) %>% 
+  select_if(is.numeric) %>% 
+  cor() %>% 
+  corrplot(type = "lower", diag = FALSE,method = "circle",bg = "#2A2E37") 
+```
+
+The plot reveals that touches and minutes exhibit strong positive correlations with almost all other variables. This can be explained since players who spend more time on the pitch tend to have a greater number of touches, leading to more performance statistics overall. Are there any dominant predictors among them? This question might be answered later！
+Also, we find that there is a strong negative relationship between position and clearances, which might indicates players of some positions tends to make more clearances in the matches.
+
+## Setting up for the Models
+
+Now that we have explored and visualized our data, it's time to move on to the next step of modeling. Before we can fit our models, we need to set up our data by splitting it into training and testing sets, creating a recipe to preprocess the data, and creating folds for k-fold cross-validation.
+
+### Data Split
+
+Here we choose a 80/20 split on the data set so that we have 80% of the data for training and 20% for testing, stratifing on the outcome variable `value`.
+
+```{r}
+set.seed(0321)
+tmv_split <- initial_split(tmv, prop = 0.8, strata = value)
+tmv_train <- training(tmv_split)
+tmv_test <- testing(tmv_split)
+```
+
+Check if the split is correct:
+
+```{r}
+nrow(tmv_train)/nrow(tmv)
+nrow(tmv_test)/nrow(tmv)
+```
+
+The training set has about 80% of the data and the testing set has about 20% of the data. So, the data was split correctly between the training and testing sets.
+
+### K-Fold Cross Validation
+
+Now we create a 10 folds on the training set for cross validation.
+
+During k-fold cross-validation, the data is partitioned into k folds, as explained earlier, with each fold serving as a testing set and the remaining k-1 folds as the training set. The model under consideration is fitted to each training set and then tested on the corresponding testing set (with a different fold used as a validation set each time). Performance is measured using the average accuracy from the testing sets of all folds (although other metrics, such as standard error, can also be used).
+
+We choose k-fold cross-validation over fitting and testing models on the entire training set because it provides a more accurate estimate of testing accuracy. By calculating the mean accuracy from multiple samples instead of relying on a single accuracy value from one sample, we minimize variation as the sample size increases.
+
+```{r}
+tmv_folds <- vfold_cv(tmv_train, v = 10, strata = value)
+```
+
+### Recipe Creation
+
+We will be using the 18 predictors: "nationality", "position", "age", "value", "foot", "minutes", "goals", "assists", "shots_on_target_pct", "passes", "tackles", "blocks", "interceptions", "clearances", "errors", "touches", "dribbles", "fouls" and "aerials_won". 
+Also, we dummy code the categorical variables nationality, foot and position. 
+Finally, we normalize our variables by centering and scaling.
+
+```{r}
+tmv_rec <- recipe(value ~ ., data = tmv %>% select(-player)) %>% 
+  step_dummy(nationality, foot, position) %>% 
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())
+```
+
+## Model Building
+
+We're ready to create our models! To save time, we've already generated the results for each model so we won't have to rerun them multiple times. I've chosen Root Mean Squared Error (RMSE) as the evaluation metric for all regression models because it provides a comprehensive assessment. RMSE is commonly used in regression models to determine the difference between predicted and actual values, using the Euclidean distance. A lower RMSE is preferred since it indicates that the predicted values are closer to the actual values. To ensure accuracy, we've normalized the data in the recipe. We've created eight models, but we'll focus on the top four in terms of performance. Now, let's get started with building our models!
+
+Each model followed a similar process, consisting of these seven steps:
+
+1.Initialize the model by selecting the desired model, parameters to tune, the engine the model is based on, and the mode (regression or classification) if needed.
+2. Establish the workflow for the model and include the model and the recipe.
+3. Create a tuning grid to define the parameter ranges to be tuned and their respective levels.
+4. Tune the model, specifying the workflow, k-fold cross-validation folds, and the tuning grid for the chosen parameters.
+5. Save the tuned models to an RDS file to eliminate the need for rerunning the model.
+6. Reload the saved files.
+7. Gather the metrics of the tuned models, sort them in ascending order of the mean to identify the lowest RMSE for each tuned model, and select only the lowest RMSE. Store the RMSE in a variable for comparison purposes.
+
+I will detail the code below the section of each model (however, the training code will be commented out to save time).
+
+![](image/neymar.gif)
+
+### Linear Regression
+
+```{r}
+lm_model <- linear_reg() %>% 
+  set_engine("lm")
+
+lm_wf <- workflow() %>% 
+  add_model(lm_model) %>% 
+  add_recipe(tmv_rec)
+
+# lm_fit <- fit_resamples(
+#   lm_wf,
+#   resamples = tmv_folds,
+#   metrics = metric_set(rmse, rsq),
+#   control = control_resamples(save_pred = TRUE)
+# )
+# 
+# save(lm_fit, file = "tuned_models/lm_fit.rda")
+```
+
+```{r}
+load("tuned_models/lm_fit.rda")
+
+lm_metrics <- collect_metrics(lm_fit)%>% 
+  slice(1)
+
+lm_metrics
+```
+Our linear regression model have a rmse of 11.34409!
+
+<!-- ### Polynomial Regression  -->
+<!-- ```{r} -->
+<!-- # Adjusting the recipe because the tuning parameter must be added in the recipe for polynomial regression -->
+<!-- # Tuning the degree -->
+<!-- poly_rec <- tmv_rec %>%  -->
+<!--   step_poly(age,foot, minutes, goals, assists, shots_on_target_pct, passes, tackles, blocks, interceptions, clearances, errors, touches, dribbles, fouls, aerials_won, degree = tune()) -->
+
+<!-- poly_model <- linear_reg() %>%  -->
+<!--   set_mode("regression") %>%  -->
+<!--   set_engine("lm") -->
+
+<!-- poly_wf <- workflow() %>%  -->
+<!--   add_model(poly_model) %>%  -->
+<!--   add_recipe(poly_rec) -->
+
+<!-- poly_grid <- grid_regular(degree(range = c(1,5)), levels = 5) -->
+
+<!-- poly_tune <- tune_grid( -->
+<!--   poly_wf, -->
+<!--   resamples = tmv_folds, -->
+<!--   grid = poly_grid -->
+<!-- ) -->
+
+<!-- save(poly_tune, file = "tuned_models/poly_tune.rda") -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- load("tuned_models/poly_tune.rda") -->
+<!-- poly_metrics <- collect_metrics(poly_tune) -->
+<!-- poly_metrics -->
+<!-- ``` -->
+
+### k-Nearest Neighbors
+
+```{r}
+knn_model <- nearest_neighbor(neighbors = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("kknn")
+
+knn_wf <- workflow() %>% 
+  add_model(knn_model) %>% 
+  add_recipe(tmv_rec)
+
+knn_grid <- grid_regular(neighbors(range = c(41,50)), levels = 10)
+
+# knn_tune <- tune_grid(
+#   knn_wf,
+#   resamples = tmv_folds,
+#   grid = knn_grid, control = control_grid(verbose = TRUE))
+# 
+# save(knn_tune, file = "tuned_models/knn_tune.rda")
+```
+
+```{r}
+load("tuned_models/knn_tune.rda")
+autoplot(knn_tune, metric = 'rmse')+ geom_line(aes(group = 1), color = "pink") + geom_point(color = "pink") + vapor_theme()
+```
+```{r}
+knn_metrics <- collect_metrics(knn_tune) %>% 
+  arrange(mean) %>% 
+  slice(11)
+knn_metrics
+```
+We have our best KNN model with 46 neighbors that has mrse 13.1196!
+
+### Elastic Net Regression
+
+```{r}
+en_model<- linear_reg(mixture = tune(), 
+                              penalty = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("glmnet")
+
+en_wf <- workflow() %>% 
+  add_recipe(tmv_rec) %>% 
+  add_model(en_model)
+
+en_grid <- grid_regular(penalty(range = c(0, 0.2),
+                                     trans = identity_trans()),
+                        mixture(range = c(0.3, 0.4)),
+                             levels = 10)
+# en_tune <- tune_grid(
+#   en_wf,
+#   resamples = tmv_folds,
+#   grid = en_grid, control = control_grid(verbose = TRUE))
+# 
+# save(en_tune, file = "tuned_models/en_tune.rda")
+```
+```{r}
+load("tuned_models/en_tune.rda")
+autoplot(en_tune, metric = 'rmse')+ vapor_theme()
+```
+
+For the elastic net, we tuned penalty and mixture at 10 different levels. A trial train with a wider range of tune grid shows that the model works the best with enalty around 0.1111111 and mixture around 0.4444444. Thus here we fine tune our model by setting the range of penalty by (0,0.2) the the range of mixture by (0.3,0.4).
+
+```{r}
+en_metrics <- collect_metrics(en_tune) %>% 
+  arrange(mean) %>%
+  slice(101)
+en_metrics
+```
+In the end, our best Elastic Net Regression model with penalty 0.1111111 and mixture 0.4 has rmse  11.32684, which is the best so far!
+
+![](image/goal.gif)
+
+### Random Forest
+
+```{r}
+rf_model <- rand_forest(mtry = tune(), 
+                           trees = tune(), 
+                           min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("regression")
+
+rf_wf <- workflow() %>% 
+  add_model(rf_model) %>% 
+  add_recipe(tmv_rec)
+
+rf_grid <- grid_regular(mtry(range = c(1, 16)), 
+                        trees(range = c(200, 600)),
+                        min_n(range = c(10, 20)),
+                        levels = 8)
+
+# rf_tune <- tune_grid(
+#   rf_wf, 
+#   resamples = tmv_folds, 
+#   grid = rf_grid,
+#   control = control_grid(verbose = TRUE)
+# )
+# save(rf_tune, file = "tuned_models/rf_tune.rda")
+```
+
+```{r}
+load("tuned_models/rf_tune.rda")
+autoplot(rf_tune, metric = 'rmse')+ vapor_theme()
+```
+
+For the random forest, we tuned the the minimal node size, the number of randomly selected predictors, and the number of trees. It may be important to note that the range of the number of randomly selected predictors for this model goes up to 16 rather than 18 (all predictors) to avoid creating a bagging model. The problem with a bagging model is that, because all the predictors are used, each tree may make the same first split. If all the trees have the same first split, every tree would no longer be independent from one another, which is an important assumption we make. And so, the range of the number of randomly selected predictors should be less than the total number of predictors, which is why I chose a slightly lower value at 16. From the plots, we can see that the number of trees and the minimal node size do not seem to have much effect on the performance of the model and the optimal node size appears to be at 12. The number of predictors appears to have a greatest effect on performance. From the plots, it appears that, overall, a greater number of predictors renders a better performance. It seems that including the most(16) predictors gives the lowest RMSE here. Based on the RMSE values in the plots, this model definitely performs the best!
+
+```{r}
+rf_metrics <- collect_metrics(rf_tune)%>% 
+  arrange(mean) %>% 
+  slice(126)
+rf_metrics
+```
+Thus,our best Random Forest model is model 30 with trees 200, mtry 16 and min_n 12! It achieves an rmse of 11.33007!
+
+### Gradient-Boosted Trees
+
+```{r}
+bt_model <- boost_tree(trees = tune(),
+                       learn_rate = tune(),
+                       min_n = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+bt_wf <- workflow() %>% 
+  add_model(bt_model) %>% 
+  add_recipe(tmv_rec)
+
+
+bt_grid <- grid_regular(trees(range = c(1, 500)), learn_rate(range = c(0.01,0.1), trans = identity_trans()), min_n(range = c(15, 30)), levels = 5)
+
+# bt_tune <- tune_grid(
+#   bt_wf,
+#   resamples = tmv_folds,
+#   grid = bt_grid,
+#   control = control_grid(verbose = TRUE)
+# )
+# save(bt_tune, file = "tuned_models/bt_tune.rda")
+```
+
+```{r}
+load("tuned_models/bt_tune.rda")
+autoplot(bt_tune, metric = "rmse")+ vapor_theme()
+```
+
+For the gradient-boosted trees, we tuned the learning rate, number of trees, and minimal node size with 5 different levels. It may be useful to note that some tweaking of the model was done prior to finalizing the ranges for these parameters. The model did substantially worse when the minimal node size was a larger number, which is why the range 15 to 30 was chosen. Also, the model did not do as well when the learning rate was too high. A high learning rate causes the model to learn faster, but it also trains the model less and makes it less generalized. So, the range 0.01 to 0.1 was chosen to see which smaller learning rate value performs the best. From the starting points of each of the plots, it appears that the model does better at a higher learning rate. This means that the model does better when it is learning faster. Also, it appears that generally, once there are more than ~100 trees, the number of trees does not make much of a change on the performance of the model. However, the model appears to do worse when there are less than ~100 trees. The optimal minimal node size is ~18.
+
+```{r}
+bt_metrics <- collect_metrics(bt_tune)%>% 
+  arrange(mean) %>% 
+  slice(126)
+bt_metrics
+```
+Eventually, our best Gradient-Boosted Trees is Model 58 with 250 trees, minimal node size 18 learning rate 0.055! It has a rmse value of 10.62065, which is our new best!
+
+![](image/messiwc.gif)
+
+## Best Model
+
+It’s finally time to compare the results of all of our models and see which ones performed the best!
+
+```{r}
+# Creating a tibble of all the models and their RMSE
+final_compare_tibble <- tibble(Model = c("Linear Regression", "K Nearest Neighbors", "Elastic Net", "Random Forest", "Gradient-Boosted Trees"), RMSE = c(lm_metrics$mean, knn_metrics$mean, en_metrics$mean, rf_metrics$mean, bt_metrics$mean))
+
+# Arranging by lowest RMSE
+final_compare_tibble <- final_compare_tibble %>% 
+  arrange(RMSE)
+
+final_compare_tibble
+```
+
+Here is a visualization of these results:
+
+```{r}
+# Creating a data frame of the model RMSE's so we can plot
+all_models <- data.frame(Model = c("Linear Regression", "K Nearest Neighbors", "Elastic Net", "Random Forest", "Boosted Trees"), RMSE = c(lm_metrics$mean, knn_metrics$mean, en_metrics$mean, rf_metrics$mean, bt_metrics$mean))
+
+# Creating a barplot of the RMSE values
+ggplot(all_models, aes(x=Model, y=RMSE)) +
+  geom_bar(stat = "identity", aes(fill = Model)) +
+  scale_fill_manual(values = c("pink1", "green1", "pink2", "green2", "pink3")) +
+  theme(legend.position = "none") +
+  labs(title = "Comparing RMSE by Model")+ vapor_theme()
+```
+
+From the performance of the models on the cross-validation data, we can see that the gradient-boosted trees performed the best!
+
+### Putting the best Model to the Test
+It's time to evaluate the performance of our gradient-boosted trees model on a completely new set of data: the testing dataset!
+
+```{r}
+#load and select the best model
+load("tuned_models/bt_tune.rda")
+best_bt <- select_best(bt_tune)
+
+#fit it on the training dataset
+final_bt_model <- finalize_workflow(bt_wf, best_bt)
+final_bt_model <- fit(final_bt_model, tmv_train)
+
+# Creating the predicted vs. actual value tibble
+tmv_tibble <- predict(final_bt_model, new_data = tmv_test %>% select(-value))
+tmv_tibble <- bind_cols(tmv_tibble, tmv_test %>% select(value))
+
+# Save
+save(tmv_tibble, file = "finalmodel/final_model.rds")
+```
+```{r}
+# Load in final model
+load("finalmodel/final_model.rds")
+
+# Indicating the desired metric
+tmv_metric <- metric_set(rmse)
+
+# Collecting the rmse of the model on the testing data
+tmv_tibble_metrics <- tmv_metric(tmv_tibble, truth = value, estimate = .pred)
+tmv_tibble_metrics
+```
+Our model actually performed better on the testing set than on the cross-validation folds with an RMSE of 9.886753!
+
+We might also be interested in a plot of the predicted values versus the actual values:
+
+```{r}
+tmv_tibble %>% 
+  ggplot(aes(x = .pred, y = value)) +
+  geom_point(alpha = 0.3,col = "pink") +
+  geom_abline(lty = 2,col = "pink") +
+  coord_obs_pred() +
+  labs(title = "Predicted Values vs. Actual Values") +vapor_theme()
+```
+If each observation was predicted with precision, then the dots would shape a linear pattern. The points are crowded in the left bottom corner of the graph and are not very easy to read (we will give several example predictions later!). Nevertheless, the model's predictions for the "value" variable seem to follow a comparable pattern as the line, and it did not produce any negative values, indicating that the model performed reasonably fine. Hence, the gradient-boosted trees model's performance in predicting the capture rate was not dreadful, but there is certainly scope for enhancing its accuracy. 
+
+### Variable Importance
+
+Let us check what are the most influential predictor:
+```{r}
+final_bt_model %>% extract_fit_parsnip() %>% 
+  vip(aesthetics = list(fill = "pink", color = "green")) +vapor_theme()
+```
+
+It turns out that `goals`,`passes`,`dribbles`, `ages` and `assists` matter the most in predicting the outcome.Those are what we are mostly talking about a player as well, aren't they?
+
+### Prediction Examples
+
+Now let us make predictions on a few actual samples to give a direct idea of how well our model performs!
+
+#### Lional Messi
+
+Our first esteemed guest is Lional Messi, a 32 year old forward/midfield from Argentina. 
+
+![](image/messi2.jpg)
+```{r}
+sample_player1 <- tmv[238,]
+sample_player1
+```
+```{r}
+predict(final_bt_model,sample_player1)
+```
+
+We get a prediction based on his statistics of 113.3599 (million of Euros), which is very close to the actual value, 112 (million of Euros). Well done Gradient-Boosted Trees Model No.58!
+
+#### Luis Suarez
+
+Welcome our second guest, Luis Suarez from Uruguay, a powerful striker on the attacking line！
+![](image/suarez.jpg)
+```{r}
+sample_player3 <- tmv[246,]
+sample_player3
+```
+```{r}
+predict(final_bt_model,sample_player3)
+```
+Our model gives a prediction of 47.56467 (million of Euros) which is much higher than the truth, 28 (million of Euros). Is this error because of our model or, is the player underrated?
+
+#### Harry Maguire
+
+Last one! Harry Maguire, the captain of England national team, a 26-year-old defender! 
+
+![](image/maguire.jpg)
+
+```{r}
+sample_player2 <- tmv[1337,]
+sample_player2
+```
+```{r}
+predict(final_bt_model,sample_player2)
+```
+We get his statistics-based prediction, 49.568 (million of Euros), which is lower than his actual value, 56 (million of Euros). Is he overrated?
+
+## Conclusion
+
+Throughout this project, we meticulously examined our data and its various components to develop and evaluate a model capable of estimating the transfer value of soccer players. The gradient boost trees model emerged as the most effective among those models we had tried (based on RMSE), although it still has room for improvement. The K Nearest Neighbors models did the worst which is not surprising, since we have so many predictors that make the data points not close enough to each other for KNN to do well in predicting the outcome.
+
+Predicting a player's value based on match statistics has numerous practical applications in real life, such as contract negotiations, scouting and player development. It provides valuable information for people in the soccer industry, enabling them to make data-driven decisions and optimize their resources for building stronger, more competitive teams.
+
+As a soccer fan, I thoroughly enjoyed the process of working on this project. Over the past nine years of watching soccer, there were many aspects of the sport that I hadn't considered before. Diving deep into the data and exploring the intricacies of player performance, transfer values, and the impact of match statistics provided me with a fresh perspective on the game I love. This experience not only enriched my understanding of soccer but also allowed me to appreciate the complexity and nuances that make it such a captivating sport. Combining my passion for soccer with the analytical skills developed during this project has been a rewarding and fulfilling journey.
+
+![](image/van.jpg)
+
+## Sources
+
+The data was taken from the Kaggle data set, “[Soccer players values and their statistics](https://www.kaggle.com/datasets/kriegsmaschine/soccer-players-values-and-their-statistics)”, and it was scraped from transfermarkt.de and fbref.com by user RSKRIEGS.
